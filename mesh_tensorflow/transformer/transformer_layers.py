@@ -216,25 +216,19 @@ class SelfAttention(transformer.TransformerLayer):
       v = kv
     if self.attention_func == "hybrid":
       o = attention.hybrid_attention(
-          q, k, v, context,
-          memory_length,
-          self.kv_dim,
-          self.kv_dim,
-          self.compute_bias(
-              context, memory_position, x, params.query_heads_dims),
+          q, k, v, context, memory_length, self.kv_dim, self.kv_dim,
+          self.compute_bias(context, memory_position, x,
+                            params.query_heads_dims, q),
           **self.attention_kwargs_from_context(context))
     else:
       o = attention.attention(
-          q, k, v,
-          memory_length,
-          self.kv_dim,
-          self.kv_dim,
-          self.compute_bias(
-              context, memory_position, x, params.query_heads_dims),
+          q, k, v, memory_length, self.kv_dim, self.kv_dim,
+          self.compute_bias(context, memory_position, x,
+                            params.query_heads_dims, q),
           **self.attention_kwargs_from_context(context))
     return params.compute_output(o, output_shape=x.shape)
 
-  def compute_bias(self, context, memory_position, x, heads_dims):
+  def compute_bias(self, context, memory_position, x, heads_dims, q):
     """Compute attention bias.
 
     Args:
@@ -242,6 +236,7 @@ class SelfAttention(transformer.TransformerLayer):
       memory_position: an int32 tensor containing memory_length dimension.
       x: a Tensor - the query antecedent - required for relative attention
       heads_dims: a list of dimensions
+      q: a Tensor - the queries - required for contextual relative attention
     Returns:
       a Tensor or None
     """
@@ -304,16 +299,23 @@ class SelfAttention(transformer.TransformerLayer):
         values = mtf.get_variable(
             context.mesh, "relative_attention_bias",
             bias_shape, dtype=context.variable_dtype)
+        biases.append(mtf.gather(values, rp_bucket, buckets_dim))
       elif self.relative_attention_type == "contextual":
-        values = layers.dense(
-            x, [buckets_dim] + heads_dims,
-            variable_dtype=context.variable_dtype,
-            name="relative_attention_contextual",
-            expert_dims=context.model.ensemble_dims)
+        # Add heads_dims to ak_shape to not share edge representations across
+        # heads.
+        ak_shape = context.model.ensemble_dims + [buckets_dim, self.kv_dim]
+        ak = mtf.get_variable(
+            context.mesh,
+            "relative_attention_ak",
+            ak_shape,
+            dtype=context.variable_dtype)
+        values = (
+            mtf.einsum([q, ak], reduced_dims=[buckets_dim, self.kv_dim]) /
+            math.sqrt(self.kv_dim.size))
+        biases.append(values)
       else:
         raise ValueError("unrecognized relative_attention_type \"%s\"" %
                          self.relative_attention_type)
-      biases.append(mtf.gather(values, rp_bucket, buckets_dim))
     ret = mtf.add_n(biases) if biases else None
     if can_cache:
       context.cache[cache_key] = ret
@@ -545,14 +547,11 @@ class LocalSelfAttention(SelfAttention):
       memory_length = self.rename_length_to_memory_length(
           context.position, context)
       o = attention.attention(
-          q,
-          self.rename_length_to_memory_length(k, context),
+          q, self.rename_length_to_memory_length(k, context),
           self.rename_length_to_memory_length(v, context),
-          self.memory_length(context),
-          self.kv_dim,
-          self.kv_dim,
-          self.compute_bias(context, memory_length, x, params.query_heads_dims),
-          **self.attention_kwargs_from_context(context))
+          self.memory_length(context), self.kv_dim, self.kv_dim,
+          self.compute_bias(context, memory_length, x, params.query_heads_dims,
+                            q), **self.attention_kwargs_from_context(context))
     else:
       # fancy local attention algorithm
       o = attention.local_attention_1d(
